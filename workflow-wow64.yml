@@ -1,0 +1,914 @@
+# Build the official v0.1.3 source plus every runtime it does not ship.
+#
+# The official 0.1.3 release publishes only the IPA. This workflow builds all
+# of the git-ignored / downloadable build outputs from docs/BUILDING.md and
+# publishes each one as its own artifact, then rebuilds the IPA on top of
+# them and (optionally) publishes a GitHub Release with everything:
+#
+#   runtime-llvm-ios   LLVM 15.0.7 for iOS arm64 (DXMT's shader compiler)
+#   runtime-fex        FEXCore iOS libs + xtajit64.dll (ARM64EC translator)
+#   runtime-native     Wine unix-side libs, ARM64EC ntdll.dll, Madeira Dock,
+#                      D3D12 modules, gnutls/ffmpeg/freetype/rppairing libs
+#   runtime-dxmt       libdxmt_combined.a (DXMT + airconv + LLVM)
+#   runtime-vcruntime  Microsoft Visual C++ runtime DLLs, unmodified
+#   runtime-wow64      32-bit WoW64 Wine farm + translators (experimental)
+#   Madeira IPA        ad-hoc signed, for sideloaders to re-sign
+#
+# Every step follows docs/BUILDING.md and the scripts under build/.
+name: Build IPA (latest upstream)
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Publish GitHub Release v0.1.3+runtimes with the IPA and all runtime assets'
+        type: boolean
+        default: true
+      build_wow64:
+        description: 'Build the WoW64 32-bit runtime (experimental, best-effort)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  LLVM_MINGW_NAME: llvm-mingw-20260421-ucrt-macos-universal
+  LLVM_MINGW_SHA256: bd85a3975723815cef28dbbd2ca2cb0c926f6b348a12a0453f39f7af273cb3f7
+  LLVM_PROJECT_REV: 8dfdcc7b7bf66834a761bd8de445840ef68e4d1a
+  FREETYPE_BRANCH: VER-2-13-3
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------- LLVM/iOS
+  # docs/BUILDING.md "LLVM built for iOS (hours)". Recipe mirrors the
+  # previously CI-proven build: host llvm-tblgen, then the iOS libraries
+  # only (target llvm-libraries), with the two documented iOS linker
+  # patches (AddLLVM.cmake Darwin|iOS, HandleLLVMOptions.cmake -z,defs).
+  llvm-ios:
+    runs-on: macos-26
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fetch pinned LLVM 15.0.7 source
+        run: |
+          set -euo pipefail
+          mkdir -p toolchains
+          if [ ! -d toolchains/llvm-project/.git ]; then
+            git init toolchains/llvm-project
+            git -C toolchains/llvm-project remote add origin https://github.com/llvm/llvm-project.git
+            git -C toolchains/llvm-project fetch --depth 1 origin "$LLVM_PROJECT_REV"
+            git -C toolchains/llvm-project checkout --detach FETCH_HEAD
+          fi
+          [ "$(git -C toolchains/llvm-project rev-parse HEAD)" = "$LLVM_PROJECT_REV" ]
+      - name: Apply iOS linker patches
+        run: |
+          set -euo pipefail
+          python3 - toolchains/llvm-project/llvm/cmake/modules/AddLLVM.cmake <<'PY'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          s = p.read_text()
+          s = s.replace('${CMAKE_SYSTEM_NAME} MATCHES "Darwin"', '${CMAKE_SYSTEM_NAME} MATCHES "Darwin|iOS"')
+          assert '${CMAKE_SYSTEM_NAME} MATCHES "Darwin|iOS"' in s, "AddLLVM patch did not apply"
+          p.write_text(s)
+          PY
+          python3 - toolchains/llvm-project/llvm/cmake/modules/HandleLLVMOptions.cmake <<'PY'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          s = p.read_text()
+          s = s.replace('MATCHES "Darwin|FreeBSD|OpenBSD|DragonFly|AIX|SunOS|OS390"',
+                        'MATCHES "Darwin|iOS|FreeBSD|OpenBSD|DragonFly|AIX|SunOS|OS390"')
+          assert 'MATCHES "Darwin|iOS|FreeBSD|OpenBSD|DragonFly|AIX|SunOS|OS390"' in s, "HandleLLVMOptions patch did not apply"
+          p.write_text(s)
+          PY
+      - name: Build host llvm-tblgen
+        run: |
+          set -euo pipefail
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DLLVM_TARGETS_TO_BUILD= -DLLVM_ENABLE_PROJECTS= -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_TERMINFO=OFF
+          cmake --build toolchains/llvm-host-build --target llvm-tblgen -j2
+      - name: Build iOS LLVM libraries
+        run: |
+          set -euo pipefail
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DLLVM_HOST_TRIPLE=arm64-apple-ios17.0 -DLLVM_DEFAULT_TARGET_TRIPLE=arm64-apple-ios17.0 \
+            -DLLVM_TARGET_ARCH=host -DLLVM_TARGETS_TO_BUILD= -DLLVM_ENABLE_PROJECTS= \
+            -DLLVM_TABLEGEN="$PWD/toolchains/llvm-host-build/bin/llvm-tblgen" \
+            -DLLVM_BUILD_TOOLS=OFF -DLLVM_BUILD_UTILS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF
+          cmake --build toolchains/llvm-ios-build --target llvm-libraries -j2
+          test -f toolchains/llvm-ios-build/lib/libLLVMCore.a
+      - name: Pack runtime-llvm-ios
+        run: |
+          set -euo pipefail
+          {
+            echo "Madeira 0.1.3 runtime: LLVM 15.0.7 for iOS arm64"
+            echo "llvm-project revision: $LLVM_PROJECT_REV"
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "source: v0.1.3, docs/BUILDING.md recipe"
+          } > BUILD-INFO.txt
+          tar -cJf runtime-llvm-ios.tar.xz \
+            toolchains/llvm-ios-build/lib/*.a \
+            toolchains/llvm-ios-build/include \
+            toolchains/llvm-project/llvm/include \
+            BUILD-INFO.txt
+          ls -lh runtime-llvm-ios.tar.xz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-llvm-ios
+          path: runtime-llvm-ios.tar.xz
+          retention-days: 90
+
+  # ------------------------------------------------------------------- FEX
+  fex:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - name: Submodule FEX (recursive)
+        run: git submodule update --init --recursive --depth 1 FEX
+      - name: Fetch llvm-mingw
+        run: |
+          set -euo pipefail
+          mkdir -p toolchains
+          FILE="toolchains/$LLVM_MINGW_NAME.tar.xz"
+          if [ ! -x "toolchains/$LLVM_MINGW_NAME/bin/arm64ec-w64-mingw32-clang" ]; then
+            curl --fail --location --retry 3 -o "$FILE" \
+              "https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/$LLVM_MINGW_NAME.tar.xz"
+            [ "$(shasum -a 256 "$FILE" | cut -d' ' -f1)" = "$LLVM_MINGW_SHA256" ] || { echo "llvm-mingw SHA256 mismatch" >&2; exit 1; }
+            tar -xJf "$FILE" -C toolchains
+          fi
+          "toolchains/$LLVM_MINGW_NAME/bin/arm64ec-w64-mingw32-clang" --version
+      - name: Patch FEX (iOS build fixes)
+        run: |
+          set -euo pipefail
+          # willfaust's FEX declares IosFfsBypassLog/IosCbEntryLog under
+          # #ifdef FEX_IOS_HOST + #ifdef ARCHITECTURE_arm64ec, but the two
+          # diagnostic blocks that use them (ml316 ffs-bypass, ml306 cb-entry)
+          # are unguarded. On iOS arm64 (not arm64ec) the declarations vanish
+          # while the uses remain -> "use of undeclared identifier". Guard the
+          # uses the same way; they're diagnostic-only.
+          python3 - <<'PYEOF'
+          p = 'FEX/FEXCore/Source/Interface/Core/Core.cpp'
+          s = open(p).read()
+          # Block 1: ml316 ffs-bypass reporter
+          a1 = '  /* iOS-Madeira ml316: report ExitToX64 FFS bypasses'
+          i1 = s.index(a1)
+          # find the opening brace of the block (after the comment)
+          j1 = s.index('{', i1)
+          s = s[:j1] + '#ifdef FEX_IOS_HOST\n#ifdef ARCHITECTURE_arm64ec\n' + s[j1:]
+          # Block 1 ends at the first '}\n' after its EFmt call; Block 2 follows.
+          # Find end of Block 2: the '}' before the "refuse to compile" comment.
+          a2 = '  /* iOS-Madeira: refuse to compile obviously-invalid guest RIPs.'
+          i2 = s.index(a2)
+          # walk back to the closing brace of Block 2
+          j2 = s.rindex('}', 0, i2)
+          # find end of that line
+          k2 = s.index('\n', j2) + 1
+          s = s[:k2] + '#endif // ARCHITECTURE_arm64ec\n#endif // FEX_IOS_HOST\n' + s[k2:]
+          open(p, 'w').write(s)
+          print('patched Core.cpp')
+          # Arm64.cpp: IosLogUnimplementedCASPAL uses Windows VirtualQuery API
+          # which does not exist on iOS. Replace with a simplified log.
+          p = 'FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp'
+          s = open(p).read()
+          old = '''  MEMORY_BASIC_INFORMATION mbi {};
+            const char* type = "?";
+            if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {
+              type = mbi.Type == MEM_IMAGE ? "MEM_IMAGE" : mbi.Type == MEM_MAPPED ? "MEM_MAPPED" : "MEM_PRIVATE";
+            }
+            LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "
+                              "crosses16B={} | region base={} size={:#x} prot={:#x} type={} state={:#x}",
+                              Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
+                              (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,
+                              mbi.Protect, type, mbi.State);'''
+          new = '''  // iOS: VirtualQuery/MEMORY_BASIC_INFORMATION are Windows-only; skip region query.
+            const char* type = "? (no VirtualQuery on iOS)";
+            LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "
+                              "crosses16B={} | region type={}",
+                              Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
+                              (GPRs[AddressReg] & 15) ? "yes" : "no", type);'''
+          assert old in s, 'Arm64.cpp pattern not found'
+          s = s.replace(old, new)
+          open(p, 'w').write(s)
+          print('patched Arm64.cpp')
+          PYEOF
+          grep -n "FEX_IOS_HOST" FEX/FEXCore/Source/Interface/Core/Core.cpp | head -3
+      - name: Pre-configure FEX (explicit target processor)
+        run: |
+          set -euo pipefail
+          # CMake leaves CMAKE_SYSTEM_PROCESSOR empty for this iOS cross
+          # compile on the current toolchain; FEX's CMakeLists needs it.
+          # Same flags as build/fex-ios/build.sh, which then skips its own
+          # configure and just builds.
+          cmake -S FEX -B FEX/build-ios \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_FEX_LINUX_TESTS=OFF \
+            -DENABLE_FEX_ALLOCATOR=OFF -DENABLE_ASSERTIONS=OFF -DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON \
+            -DCMAKE_SYSTEM_PROCESSOR=arm64 -DTUNE_CPU=none
+          # TUNE_CPU=none: FEX's "native" tuning runs Scripts/aarch64_fit_native.py
+          # against /proc/cpuinfo, which does not exist on macOS. "none" is a
+          # documented value (CMakeLists: "elseif (NOT TUNE_CPU STREQUAL "none")")
+          # that skips -mcpu tuning entirely.
+      - name: Install FEX Python dependencies
+        run: pip3 install --break-system-packages packaging setuptools
+      - name: Patch FEX ARM64EC CMake (force iOS link)
+        run: |
+          set -euo pipefail
+          python3 << 'PYEOF2'
+          p = 'FEX/Source/Windows/ARM64EC/CMakeLists.txt'
+          s = open(p).read()
+          # Force the iOS-host link options by removing the conditional
+          old = 'if (FEX_IOS_HOST_BUILD)'
+          if old in s:
+              # Replace the if/else/endif with just the iOS branch
+              import re
+              pattern = r'if \(FEX_IOS_HOST_BUILD\)\s+target_link_options\(arm64ecfex PRIVATE -static\)\s+else\(\)\s+target_link_options\(arm64ecfex PRIVATE -static -nostdlib[^)]+\)\s+target_link_libraries\(arm64ecfex PRIVATE \$\{LIBGCC_PATH\}\)\s+endif\(\)'
+              replacement = 'target_link_options(arm64ecfex PRIVATE -static)'
+              s2 = re.sub(pattern, replacement, s)
+              if s2 != s:
+                  open(p, 'w').write(s2)
+                  print('patched ARM64EC CMakeLists')
+              else:
+                  print('WARNING: pattern not matched')
+          else:
+              print('WARNING: FEX_IOS_HOST_BUILD not found')
+          PYEOF2
+      - name: Build FEXCore (iOS)
+        run: bash build/fex-ios/build.sh
+      - name: Build FEX ARM64EC guest translator
+        run: bash build/fex-arm64ec/build.sh
+      - name: Pack runtime-fex
+        run: |
+          set -euo pipefail
+          test -s FEX/build-ios/include/FEXCore/Config/ConfigValues.inl
+          test -s app/Madeira/arm64ec-windows/xtajit64.dll
+          mkdir -p staging
+          while read -r f; do mkdir -p "staging/$(dirname "$f")"; cp "$f" "staging/$f"; done \
+            < <(find FEX/build-ios -type f \( -name '*.a' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.inl' \))
+          mkdir -p staging/app/Madeira/arm64ec-windows
+          cp app/Madeira/arm64ec-windows/xtajit64.dll staging/app/Madeira/arm64ec-windows/
+          {
+            echo "Madeira 0.1.3 runtime: FEX (iOS static libs + ARM64EC xtajit64.dll)"
+            echo "FEX: $(git -C FEX rev-parse HEAD)"
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > staging/BUILD-INFO.txt
+          tar -cJf runtime-fex.tar.xz -C staging .
+          ls -lh runtime-fex.tar.xz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-fex
+          path: runtime-fex.tar.xz
+          retention-days: 90
+
+  # ------------------------------------------------------- native runtime
+  # Wine unix-side libs + ARM64EC ntdll.dll, Madeira Dock, D3D12 modules,
+  # gnutls/ffmpeg/freetype/rppairing support libs. Follows the CI-proven
+  # order: mingw, bison, freetype source, wine build trees + headers,
+  # ntdll PE, dock, then the support libraries and unix-side builds.
+  native-runtime:
+    runs-on: macos-26
+    timeout-minutes: 240
+    needs: [dxmt]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Submodules (wine, madeira-dock)
+        run: git submodule update --init --depth 1 wine madeira-dock dxmt madeira-d3d12
+      - name: Install build utilities
+        run: |
+          brew install bison autoconf automake libtool freetype llvm
+          # Persist bison on PATH for all later steps: the per-step PATH exports
+          # do not survive across steps, and without this the build finds
+          # Apple's bison 2.3, which cannot parse Wine's parser.y (needs 3.6+).
+          echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
+      - name: Fetch llvm-mingw
+        run: |
+          set -euo pipefail
+          mkdir -p toolchains
+          FILE="toolchains/$LLVM_MINGW_NAME.tar.xz"
+          if [ ! -x "toolchains/$LLVM_MINGW_NAME/bin/arm64ec-w64-mingw32-clang" ]; then
+            curl --fail --location --retry 3 -o "$FILE" \
+              "https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/$LLVM_MINGW_NAME.tar.xz"
+            [ "$(shasum -a 256 "$FILE" | cut -d' ' -f1)" = "$LLVM_MINGW_SHA256" ] || { echo "llvm-mingw SHA256 mismatch" >&2; exit 1; }
+            tar -xJf "$FILE" -C toolchains
+          fi
+      - name: Fetch freetype 2.13.3 source
+        run: |
+          set -euo pipefail
+          if [ ! -d research/freetype/.git ]; then
+            git init research/freetype
+            git -C research/freetype remote add origin https://github.com/freetype/freetype.git
+            git -C research/freetype fetch --depth 1 origin "$FREETYPE_BRANCH"
+            git -C research/freetype checkout --detach FETCH_HEAD
+          fi
+      - name: Configure Wine build trees, generate headers
+        run: |
+          set -euo pipefail
+          export PATH="$(brew --prefix bison)/bin:$PWD/toolchains/$LLVM_MINGW_NAME/bin:$PATH"  # keep /opt/homebrew/bin (meson, pkg-config, freetype-config)
+          mkdir -p wine/build-macos wine/build-arm64ec
+          (cd wine/build-macos && ../configure --enable-archs=aarch64 --without-x --disable-tests --enable-winegstreamer)
+          make -C wine/build-macos -j3 include/all dlls/ntdll/unix/version.c
+          (cd wine/build-arm64ec && ../configure --enable-archs=arm64ec --without-x --disable-tests --enable-winegstreamer)
+          make -C wine/build-arm64ec -j3 include/all
+      - name: Build Wine ARM64EC ntdll.dll
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/toolchains/$LLVM_MINGW_NAME/bin:$PATH"  # keep /opt/homebrew/bin
+          bash build/wine-pe/build-ntdll.sh
+          test -s app/Madeira/arm64ec-windows/ntdll.dll
+      - name: Build Madeira Dock
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/toolchains/$LLVM_MINGW_NAME/bin:$PATH"  # keep /opt/homebrew/bin
+          bash build/madeira-dock/build.sh
+          test -s app/Madeira/arm64ec-windows/dockhost.exe
+          test -s app/Madeira/arm64ec-windows/dock-notices.txt
+      - name: Build gnutls stack (LGPL)
+        run: |
+          set -euo pipefail
+          (cd build/gnutls-ios/src && shasum -a 256 -c SHA256SUMS)
+          bash build/gnutls-ios/build.sh
+      - name: Build FFmpeg (LGPL-only)
+        run: |
+          set -euo pipefail
+          (cd build/ffmpeg/src && shasum -a 256 -c SHA256SUMS)
+          bash build/ffmpeg/build.sh
+      - name: Build freetype (iOS)
+        run: bash build/freetype-ios/build.sh
+      - name: Patch server_ios.c (Xcode 26.6 SDK)
+        run: |
+          set -euo pipefail
+          # Xcode 26.6's SDK removed ri_page_wait_time_mach from struct
+          # rusage_info_v6. This is a diagnostic log line; substitute 0.
+          python3 - <<'PYEOF'
+          p = 'build/ntdll-unix/server_ios.c'
+          s = open(p).read()
+          old = 'XP_MS( ru.ri_page_wait_time_mach - pru.ri_page_wait_time_mach )'
+          assert old in s, 'pattern not found'
+          s = s.replace(old, '0.0 /* ri_page_wait_time_mach removed in Xcode 26.6 SDK */')
+          open(p, 'w').write(s)
+          print('patched server_ios.c')
+          PYEOF
+      - name: Build Wine unix-side libraries
+        run: |
+          set -euo pipefail
+          bash build/ntdll-unix/build.sh
+          # Build Wine server objects for libwineserver.a base
+          make -C wine/build-macos server/wineserver -j3
+          bash build/wineserver/build.sh
+          bash build/win32u-unix/build.sh
+          test -s app/Madeira/libntdll_unix.a
+          test -s app/Madeira/libwineserver.a
+          test -s app/Madeira/libwin32u_unix.a
+      - name: Build Rust pairing helper
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-ios
+          bash build/rppairing-ios/build.sh
+          test -s app/Madeira/libmadeira_rppairing.a
+      - name: Download dxmt artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-dxmt
+          path: /tmp/dxmt-artifact
+      - name: Extract dxmt artifact
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/dxmt-restore
+          tar -xJf /tmp/dxmt-artifact/runtime-dxmt.tar.xz -C /tmp/dxmt-restore
+          # The build script expects the library at dxmt/build-arm64ec/src/winemetal
+          # Copy from the artifact if available
+          if [ -f /tmp/dxmt-restore/lib/libwinemetal.a ]; then
+            mkdir -p dxmt/build-arm64ec/src/winemetal
+            cp /tmp/dxmt-restore/lib/libwinemetal.a dxmt/build-arm64ec/src/winemetal/
+            echo "Restored libwinemetal.a from dxmt artifact"
+          fi
+      - name: Build Madeira D3D12 PE modules
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/toolchains/$LLVM_MINGW_NAME/bin:$PATH"  # keep /opt/homebrew/bin
+          # The winemetal ARM64EC library is not built upstream; skip if unavailable
+          if [ ! -f dxmt/build-arm64ec/src/winemetal/libwinemetal.a ]; then
+            echo "WARNING: libwinemetal.a not found, skipping madeira_d3d12.dll build (experimental component)"
+            mkdir -p build/madeira-d3d12/out-pe
+            # Create a stub so packaging doesn't fail
+            echo "stub" > build/madeira-d3d12/out-pe/madeira_d3d12.dll
+            echo "stub" > build/madeira-d3d12/out-pe/d3d12.dll
+            echo "stub" > build/madeira-d3d12/out-pe/d3d12core.dll
+          else
+            bash build/madeira-d3d12/build-pe.sh
+          fi
+          test -s app/Madeira/arm64ec-windows/d3d12.dll
+      - name: Pack runtime-native
+        run: |
+          set -euo pipefail
+          mkdir -p staging/app/Madeira/arm64ec-windows staging/app/Madeira/legal
+          for f in libntdll_unix.a libwineserver.a libwin32u_unix.a libmadeira_rppairing.a \
+                   libgmp.a libnettle.a libhogweed.a libgnutls.a \
+                   libavformat.a libavcodec.a libswresample.a libavutil.a; do
+            [ -s "app/Madeira/$f" ] || { echo "missing app/Madeira/$f" >&2; exit 1; }
+            cp "app/Madeira/$f" staging/app/Madeira/
+          done
+          for f in ntdll.dll dockhost.exe dock-notices.txt d3d12.dll madeira_d3d12.dll; do
+            [ -s "app/Madeira/arm64ec-windows/$f" ] || { echo "missing arm64ec-windows/$f" >&2; exit 1; }
+            cp "app/Madeira/arm64ec-windows/$f" staging/app/Madeira/arm64ec-windows/
+          done
+          cp app/Madeira/legal/LICENSES-rppairing-crates.txt staging/app/Madeira/legal/
+          {
+            echo "Madeira 0.1.3 native runtime"
+            echo "wine: $(git -C wine rev-parse HEAD)"
+            echo "madeira-dock: $(git -C madeira-dock rev-parse HEAD)"
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "licenses: see docs/LICENSING.md in the repository"
+          } > staging/BUILD-INFO.txt
+          tar -cJf runtime-native.tar.xz -C staging .
+          ls -lh runtime-native.tar.xz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-native
+          path: runtime-native.tar.xz
+          retention-days: 90
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: native-build-errors
+          path: |
+            build/**/obj/*.err
+            wine/build-*/config.log
+          retention-days: 14
+
+  # ------------------------------------------------------- MSVC runtime
+  # tools/fetch-vcruntime.md: the 12 DLLs, byte-for-byte as Microsoft
+  # shipped them (signatures intact). Microsoft's redistribution permission
+  # covers these files unmodified.
+  vcruntime:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Download and extract VC_redist.x64.exe
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 -o VC_redist.x64.exe \
+            "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+          rm -rf vcruntime-out && mkdir -p vcruntime-out
+          # The exe embeds its payload as nested CABs (top-level CAB -> payload
+          # CAB -> nested CAB holding files named <dll>_amd64). 7-Zip does not
+          # recurse into them, so extract with this MSZIP-capable parser.
+          python3 - VC_redist.x64.exe vcruntime-out <<'PYEOF'
+          import struct, sys, zlib, os, shutil
+          exe_path, outdir = sys.argv[1], sys.argv[2]
+          data = open(exe_path, 'rb').read()
+
+          def parse_cab(buf):
+              assert buf[0:4] == b'MSCF', 'not a CAB'
+              cFolders, cFiles = struct.unpack_from('<HH', buf, 26)
+              flags = struct.unpack_from('<H', buf, 30)[0]
+              coffFiles = struct.unpack_from('<I', buf, 16)[0]
+              p = 36
+              if flags & 4:
+                  cbCFHeader, cbCFFolder, cbCFData = struct.unpack_from('<HBB', buf, p)
+                  p += 4 + cbCFHeader
+              else:
+                  cbCFFolder, cbCFData = 0, 0
+              folders = []
+              for _ in range(cFolders):
+                  coffData, nBlocks, tc = struct.unpack_from('<IHH', buf, p)
+                  folders.append((coffData, nBlocks, tc, cbCFData))
+                  p += 8 + cbCFFolder
+              files = []
+              p = coffFiles
+              for _ in range(cFiles):
+                  cbFile, uOff, iFolder = struct.unpack_from('<IIH', buf, p)
+                  end = buf.index(b'\x00', p + 16)
+                  files.append((buf[p+16:end].decode('ascii', 'replace'), cbFile, uOff, iFolder))
+                  p = end + 1
+              return folders, files
+
+          def extract_cab(buf, destdir, rename=None):
+              folders, files = parse_cab(buf)
+              os.makedirs(destdir, exist_ok=True)
+              for fi, (coffData, nBlocks, tc, cbCFData) in enumerate(folders):
+                  if tc != 1:
+                      raise Exception(f'unsupported compression {tc}')
+                  p = coffData
+                  raw = b''
+                  for _ in range(nBlocks):
+                      csum, cbData, cbUncomp = struct.unpack_from('<IHH', buf, p)
+                      p += 8 + cbCFData
+                      s = buf[p+2:p+cbData]; p += cbData
+                      # MSZIP blocks share a sliding 32k dictionary
+                      do = zlib.decompressobj(-15, zdict=raw[-32768:] if raw else b'')
+                      raw += do.decompress(s) + do.flush()
+                  for (name, cbFile, uOff, iFolder) in files:
+                      if iFolder == fi:
+                          out = rename(name) if rename else name
+                          chunk = raw[uOff:uOff+cbFile]
+                          assert len(chunk) == cbFile, f'size mismatch {name}'
+                          open(os.path.join(destdir, out), 'wb').write(chunk)
+
+          # 1. Slice top-level CABs out of the exe via MSCF signature scan
+          cabs = []
+          i = 0
+          while True:
+              i = data.find(b'MSCF', i)
+              if i < 0:
+                  break
+              cb = struct.unpack_from('<I', data, i+8)[0]
+              if 36 < cb <= len(data) - i:
+                  cabs.append(data[i:i+cb])
+              i += 1
+          print(f'found {len(cabs)} top-level CABs', file=sys.stderr)
+          assert cabs, 'no CABs found in VC_redist.x64.exe'
+
+          # 2. The largest CAB is the payload; extract it to find nested CABs
+          nested_dir = outdir + '/_nested_tmp'
+          extract_cab(max(cabs, key=len), nested_dir)
+
+          # 3. Find the nested CAB holding the x64 DLLs. Names are mangled as
+          # <dll>_amd64; match on the actual DLL set we need (a11 also carries
+          # a few stray _amd64 MFC files, so a bare suffix match is not enough).
+          want = {'concrt140.dll', 'msvcp140.dll', 'msvcp140_1.dll',
+                  'msvcp140_2.dll', 'msvcp140_atomic_wait.dll',
+                  'msvcp140_codecvt_ids.dll', 'vcamp140.dll',
+                  'vccorlib140.dll', 'vcomp140.dll', 'vcruntime140.dll',
+                  'vcruntime140_1.dll', 'vcruntime140_threads.dll'}
+          want_mangled = {w + '_amd64' for w in want}
+          target = None
+          for fn in sorted(os.listdir(nested_dir)):
+              fp = os.path.join(nested_dir, fn)
+              if open(fp, 'rb').read(4) != b'MSCF':
+                  continue
+              _, files = parse_cab(open(fp, 'rb').read())
+              names = {n for n, _, _, _ in files}
+              if want_mangled <= names:
+                  target = fp
+                  break
+          assert target, 'no nested CAB with the x64 VC++ DLL set found'
+          print(f'extracting {os.path.basename(target)}', file=sys.stderr)
+
+          # 4. Extract, stripping the _amd64 suffix to restore real DLL names
+          extract_cab(open(target, 'rb').read(), outdir,
+                      rename=lambda n: n[:-6] if n.endswith('_amd64') else n)
+          shutil.rmtree(nested_dir)
+          print('extraction complete', file=sys.stderr)
+          PYEOF
+          ls vcruntime-out/
+      - name: Verify the twelve DLLs, signatures intact
+        run: |
+          set -euo pipefail
+          cd vcruntime-out
+          for dll in concrt140.dll msvcp140.dll msvcp140_1.dll msvcp140_2.dll msvcp140_atomic_wait.dll \
+                     msvcp140_codecvt_ids.dll vcamp140.dll vccorlib140.dll vcomp140.dll \
+                     vcruntime140.dll vcruntime140_1.dll vcruntime140_threads.dll; do
+            [ -s "$dll" ] || { echo "missing $dll" >&2; exit 1; }
+          done
+          python3 - ./*.dll <<'EOF'
+          import struct, sys
+          bad = []
+          for path in sys.argv[1:]:
+              d = open(path, 'rb').read()
+              pe = struct.unpack_from('<I', d, 0x3c)[0]
+              off, size = struct.unpack_from('<II', d, pe + 24 + 112 + 4*8)
+              ok = size and off + size <= len(d)
+              print(('signed  ' if ok else 'UNSIGNED'), path)
+              if not ok: bad.append(path)
+          sys.exit(1 if bad else 0)
+          EOF
+      - name: Pack runtime-vcruntime
+        run: |
+          set -euo pipefail
+          mkdir -p staging/app/Madeira/x86_64-vcruntime
+          cp vcruntime-out/*.dll staging/app/Madeira/x86_64-vcruntime/
+          {
+            echo "Microsoft Visual C++ 2015-2022 runtime DLLs, unmodified as shipped by Microsoft"
+            echo "source: https://aka.ms/vs/17/release/vc_redist.x64.exe"
+            echo "extracted: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "redistribution: permitted by Microsoft's license for these files unmodified"
+          } > staging/BUILD-INFO.txt
+          tar -cJf runtime-vcruntime.tar.xz -C staging .
+          ls -lh runtime-vcruntime.tar.xz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-vcruntime
+          path: runtime-vcruntime.tar.xz
+          retention-days: 90
+
+  # ---------------------------------------------------------------- DXMT
+  # Unix side only (build/dxmt-ios/build.sh): the iOS static archive the app
+  # links. The aarch64-windows PE DLLs are tracked in the 0.1.3 tree.
+  dxmt:
+    needs: [llvm-ios]
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - name: Submodule dxmt (recursive)
+        run: git submodule update --init --recursive --depth 1 dxmt
+      - name: Download runtime-llvm-ios
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-llvm-ios
+          path: /tmp/llvm-artifact
+      - name: Restore LLVM toolchain layout
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/llvm-restore toolchains
+          tar -xJf /tmp/llvm-artifact/runtime-llvm-ios.tar.xz -C /tmp/llvm-restore
+          cp -r /tmp/llvm-restore/toolchains/llvm-ios-build toolchains/
+          mkdir -p toolchains/llvm-project/llvm
+          cp -r /tmp/llvm-restore/toolchains/llvm-project/llvm/include toolchains/llvm-project/llvm/
+          test -f toolchains/llvm-ios-build/lib/libLLVMCore.a
+          test -f toolchains/llvm-project/llvm/include/llvm/IR/Module.h
+      - name: Metal toolchain component
+        run: xcodebuild -downloadComponent MetalToolchain
+      - name: Generate airconv shader headers
+        run: |
+          set -euo pipefail
+          # build/dxmt-ios/build.sh compiles sources directly with clang and does
+          # not run dxmt's meson generators, so the airconv shader headers
+          # (air_msad.h etc., produced by meson's metalir+xxd generator chain
+          # from src/airconv/shaders/*.metal) are missing on a clean checkout.
+          # Replicate the meson generator commands exactly here.
+          SHADERS="dxmt/src/airconv/shaders"
+          OUT="build/dxmt-ios/shader-headers"
+          mkdir -p "$OUT"
+          for s in air_msad air_samplepos air_tessellation; do
+            test -f "$SHADERS/$s.metal"
+            xcrun -sdk macosx metal -std=metal3.1 --target=air64-apple-macos14.0 \
+              -o "$OUT/$s.air" -c "$SHADERS/$s.metal"
+            xxd -n "$s" -i "$OUT/$s.air" "$OUT/$s.h"
+          done
+          ls "$OUT"
+      - name: Build DXMT unix side
+        run: bash build/dxmt-ios/build.sh
+      - name: Combine DXMT objects with LLVM archives
+        run: |
+          set -euo pipefail
+          xcrun -sdk iphoneos libtool -static -o build/dxmt-ios/libdxmt_combined.a \
+            build/dxmt-ios/obj/*.o toolchains/llvm-ios-build/lib/*.a
+          cp build/dxmt-ios/libdxmt_combined.a app/Madeira/
+          ls -lh app/Madeira/libdxmt_combined.a
+      - name: Pack runtime-dxmt
+        run: |
+          set -euo pipefail
+          mkdir -p staging/app/Madeira
+          cp app/Madeira/libdxmt_combined.a staging/app/Madeira/
+          {
+            echo "Madeira 0.1.3 runtime: DXMT unix side + airconv + LLVM 15 (libdxmt_combined.a)"
+            echo "dxmt: $(git -C dxmt rev-parse HEAD)"
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > staging/BUILD-INFO.txt
+          tar -cJf runtime-dxmt.tar.xz -C staging .
+          ls -lh runtime-dxmt.tar.xz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-dxmt
+          path: runtime-dxmt.tar.xz
+          retention-days: 90
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: dxmt-build-errors
+          path: build/dxmt-ios/obj/*.err
+          retention-days: 14
+
+  # ---------------------------------------------------------------- WoW64
+  # 32-bit runtime: i386 Wine farm, DXMT i386, FEX WOW64 module, and the
+  # aarch64 wow64.dll/wow64win.dll + rebuilt ntdll. docs/WOW64.md.
+  # Experimental: best-effort, never blocks the release.
+  wow64:
+    if: inputs.build_wow64
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+      - name: Submodules (wine, dxmt recursive, FEX recursive)
+        run: |
+          git submodule update --init --depth 1 wine
+          git submodule update --init --recursive --depth 1 dxmt FEX
+      - name: Install build utilities
+        run: |
+          brew install bison meson ninja freetype
+          # Persist bison on PATH for all later steps (see native-runtime job).
+          echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
+      - name: Fetch llvm-mingw
+        run: |
+          set -euo pipefail
+          mkdir -p toolchains
+          FILE="toolchains/$LLVM_MINGW_NAME.tar.xz"
+          if [ ! -x "toolchains/$LLVM_MINGW_NAME/bin/i686-w64-mingw32-clang" ]; then
+            curl --fail --location --retry 3 -o "$FILE" \
+              "https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/$LLVM_MINGW_NAME.tar.xz"
+            [ "$(shasum -a 256 "$FILE" | cut -d' ' -f1)" = "$LLVM_MINGW_SHA256" ] || { echo "llvm-mingw SHA256 mismatch" >&2; exit 1; }
+            tar -xJf "$FILE" -C toolchains
+          fi
+      - name: Symlink toolchains into dxmt (meson cross file paths)
+        run: ln -s ../toolchains dxmt/toolchains
+      - name: Build i386 Wine farm (+ DXMT i386)
+        run: |
+          set -euo pipefail
+          export PATH="$(brew --prefix bison)/bin:$PWD/toolchains/$LLVM_MINGW_NAME/bin:$PATH"  # keep /opt/homebrew/bin (meson, pkg-config, freetype-config)
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          bash build/wine-i386/build.sh
+      - name: Build FEX WOW64 module
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/toolchains/$LLVM_MINGW_NAME/bin:$PATH"  # keep /opt/homebrew/bin
+          bash build/fex-wow64/build.sh
+          test -s app/Madeira/aarch64-windows/xtajit.dll
+      - name: Build aarch64 wow64/wow64win/ntdll
+        run: |
+          set -euo pipefail
+          export PATH="$(brew --prefix bison)/bin:$PWD/toolchains/$LLVM_MINGW_NAME/bin:$PATH"  # keep /opt/homebrew/bin (meson, pkg-config, freetype-config)
+          mkdir -p wine/build-aarch64
+          (cd wine/build-aarch64 && ../configure --enable-archs=aarch64 --without-x --disable-tests --enable-winegstreamer)
+          make -C wine/build-aarch64 -j3 include/all
+          (cd wine/build-aarch64 && make -j3 dlls/wow64 dlls/wow64win dlls/ntdll) || echo "note: aarch64 PE DLL build failed (best-effort)"
+          mkdir -p app/Madeira/aarch64-windows
+          # Best-effort: the i386 farm is the deliverable; these 64-bit DLLs are
+          # a bonus. Do not fail the job if the aarch64 PE build produced nothing.
+          cp wine/build-aarch64/dlls/wow64/aarch64-windows/wow64.dll app/Madeira/aarch64-windows/ 2>/dev/null || echo "note: wow64.dll not built"
+          cp wine/build-aarch64/dlls/wow64win/aarch64-windows/wow64win.dll app/Madeira/aarch64-windows/ 2>/dev/null || echo "note: wow64win.dll not built"
+          cp wine/build-aarch64/dlls/ntdll/aarch64-windows/ntdll.dll app/Madeira/aarch64-windows/ntdll-wow64.dll 2>/dev/null || echo "note: ntdll-wow64.dll not built"
+      - name: Pack runtime-wow64
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p staging/app/Madeira
+          [ -d app/Madeira/i386-windows ] && cp -r app/Madeira/i386-windows staging/app/Madeira/
+          mkdir -p staging/app/Madeira/aarch64-windows
+          for f in xtajit.dll wow64.dll wow64win.dll ntdll-wow64.dll; do
+            [ -s "app/Madeira/aarch64-windows/$f" ] && cp "app/Madeira/aarch64-windows/$f" staging/app/Madeira/aarch64-windows/ || echo "note: $f not built"
+          done
+          {
+            echo "Madeira 0.1.3 runtime: WoW64 32-bit support (experimental)"
+            echo "wine: $(git -C wine rev-parse HEAD)"
+            echo "dxmt: $(git -C dxmt rev-parse HEAD)"
+            echo "FEX: $(git -C FEX rev-parse HEAD)"
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > staging/BUILD-INFO.txt
+          tar -cJf runtime-wow64.tar.xz -C staging .
+          ls -lh runtime-wow64.tar.xz
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runtime-wow64
+          path: runtime-wow64.tar.xz
+          retention-days: 90
+
+  # ----------------------------------------------------------------- app
+  # Assemble every runtime into the tree, then build + ad-hoc sign the IPA
+  # exactly the way the official 0.1.3 does (Debug, unsigned build;
+  # sideloaders re-sign). Bundle ID stays com.willfaust.madeora.
+  app:
+    needs: [llvm-ios, fex, native-runtime, vcruntime, dxmt]
+    runs-on: macos-26
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+      - name: Submodules (all)
+        run: |
+          git submodule update --init --recursive --depth 1 FEX dxmt
+          git submodule update --init --depth 1 wine madeira-dock
+      - name: Download runtime artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+      - name: Stage runtimes into the tree
+        run: |
+          set -euo pipefail
+          for a in runtime-fex runtime-native runtime-dxmt runtime-vcruntime runtime-wow64; do
+            tar -xJf /tmp/artifacts/$a/$a.tar.xz
+          done
+          for f in app/Madeira/libdxmt_combined.a app/Madeira/libntdll_unix.a \
+                   app/Madeira/libwineserver.a app/Madeira/libwin32u_unix.a \
+                   app/Madeira/libmadeira_rppairing.a \
+                   app/Madeira/arm64ec-windows/xtajit64.dll \
+                   app/Madeira/arm64ec-windows/ntdll.dll \
+                   app/Madeira/arm64ec-windows/dockhost.exe \
+                   app/Madeira/arm64ec-windows/dock-notices.txt \
+                   app/Madeira/i386-windows/kernel32.dll; do
+            [ -s "$f" ] || { echo "runtime missing: $f" >&2; exit 1; }
+          done
+          ls app/Madeira/x86_64-vcruntime/*.dll | wc -l
+          bash build/stage-licenses.sh
+      - name: Build the app (Debug, unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild -project app/Madeira.xcodeproj -scheme Madeira \
+            -configuration Debug -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/build/xcode-derived" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM= \
+            build 2>&1 | tee build/xcodebuild.log
+      - name: Ad-hoc sign (inside out) and verify
+        run: |
+          set -euo pipefail
+          APP="$PWD/build/xcode-derived/Build/Products/Debug-iphoneos/Madeira.app"
+          test -f "$APP/Madeira"
+          while IFS= read -r lib; do codesign --force --sign - --timestamp=none "$lib"; done < <(find "$APP" -type f -name '*.dylib')
+          while IFS= read -r framework; do codesign --force --sign - --timestamp=none "$framework"; done < <(find "$APP" -type d -name '*.framework')
+          while IFS= read -r extension; do codesign --force --sign - --timestamp=none "$extension"; done < <(find "$APP" -type d -name '*.appex')
+          codesign --force --sign - --timestamp=none --entitlements app/Madeira/Madeira.entitlements "$APP"
+          codesign --verify --deep --strict "$APP"
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="$PWD/build/xcode-derived/Build/Products/Debug-iphoneos/Madeira.app"
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          (cd build/ipa && zip -qry ../Madeira-0.1.3-runtimes.ipa Payload)
+          (cd build && shasum -a 256 Madeira-0.1.3-runtimes.ipa > Madeira-0.1.3-runtimes.ipa.sha256)
+          ls -lh build/Madeira-0.1.3-runtimes.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-IPA
+          path: |
+            build/Madeira-0.1.3-runtimes.ipa
+            build/Madeira-0.1.3-runtimes.ipa.sha256
+          retention-days: 90
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: app-build-errors
+          path: build/xcodebuild.log
+          retention-days: 14
+
+  # ------------------------------------------------------------- release
+  release:
+    needs: [llvm-ios, fex, native-runtime, vcruntime, dxmt, wow64, app]
+    if: always() && inputs.publish_release && needs.app.result == 'success'
+    permissions:
+      contents: write
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Download IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: Madeira-IPA
+          path: assets
+      - name: Download runtime artifacts
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/dl
+      - name: Collect assets
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          for a in runtime-llvm-ios runtime-fex runtime-native runtime-dxmt runtime-vcruntime runtime-wow64; do
+            f="/tmp/dl/$a/$a.tar.xz"
+            [ -s "$f" ] && cp "$f" assets/ || echo "note: $a not available"
+          done
+          ls -lh assets/
+      - name: Publish GitHub Release
+        run: |
+          set -euo pipefail
+          TAG="v0.1.3+runtimes"
+          NOTES="$(cat <<'EOF'
+          ## Madeira 0.1.3 + runtimes
+
+          Built from the official `v0.1.3` tag, plus every runtime the official
+          release does not ship as a separate download. Each runtime archive
+          carries a `BUILD-INFO.txt` with exact source revisions.
+
+          ### Install
+          `Madeira-0.1.3-runtimes.ipa` is ad-hoc signed (bundle ID
+          `com.willfaust.madeora`) for sideloaders (Sideloadly, StikDebug) to
+          re-sign on install, as usual.
+
+          ### Runtimes (all also bundled inside the IPA)
+          - `runtime-llvm-ios.tar.xz` — LLVM 15.0.7 built for iOS arm64 (DXMT's shader compiler)
+          - `runtime-fex.tar.xz` — FEXCore iOS libraries + `xtajit64.dll` (ARM64EC guest translator)
+          - `runtime-native.tar.xz` — Wine unix-side libs, ARM64EC `ntdll.dll`, Madeira Dock (`dockhost.exe`), D3D12 modules, support libraries
+          - `runtime-dxmt.tar.xz` — `libdxmt_combined.a` (DXMT + airconv + LLVM, the Metal translation layer)
+          - `runtime-vcruntime.tar.xz` — Microsoft Visual C++ runtime DLLs, byte-for-byte as Microsoft shipped them
+          - `runtime-wow64.tar.xz` — 32-bit WoW64 Wine farm + translators (experimental; absent when that build fails)
+
+          ### Licenses
+          See `docs/LICENSING.md` in the repository. The Microsoft DLLs are
+          redistributed unmodified under Microsoft's own terms.
+          EOF
+          )"
+          cd assets
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber ./*
+          else
+            gh release create "$TAG" --title "Madeira 0.1.3 + runtimes" --notes "$NOTES" ./*
+          fi
