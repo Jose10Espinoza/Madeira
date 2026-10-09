@@ -227,28 +227,6 @@ jobs:
           # that skips -mcpu tuning entirely.
       - name: Install FEX Python dependencies
         run: pip3 install --break-system-packages packaging setuptools
-      - name: Patch FEX ARM64EC CMake (force iOS link)
-        run: |
-          set -euo pipefail
-          python3 << 'PYEOF2'
-          p = 'FEX/Source/Windows/ARM64EC/CMakeLists.txt'
-          s = open(p).read()
-          # Force the iOS-host link options by removing the conditional
-          old = 'if (FEX_IOS_HOST_BUILD)'
-          if old in s:
-              # Replace the if/else/endif with just the iOS branch
-              import re
-              pattern = r'if \(FEX_IOS_HOST_BUILD\)\s+target_link_options\(arm64ecfex PRIVATE -static\)\s+else\(\)\s+target_link_options\(arm64ecfex PRIVATE -static -nostdlib[^)]+\)\s+target_link_libraries\(arm64ecfex PRIVATE \$\{LIBGCC_PATH\}\)\s+endif\(\)'
-              replacement = 'target_link_options(arm64ecfex PRIVATE -static)\ntarget_link_libraries(arm64ecfex PRIVATE c++ c++abi unwind)'
-              s2 = re.sub(pattern, replacement, s)
-              if s2 != s:
-                  open(p, 'w').write(s2)
-                  print('patched ARM64EC CMakeLists')
-              else:
-                  print('WARNING: pattern not matched')
-          else:
-              print('WARNING: FEX_IOS_HOST_BUILD not found')
-          PYEOF2
       - name: Build FEXCore (iOS)
         run: bash build/fex-ios/build.sh
       - name: Build FEX ARM64EC guest translator
