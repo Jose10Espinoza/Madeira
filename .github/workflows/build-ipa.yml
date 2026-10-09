@@ -239,7 +239,7 @@ jobs:
               # Replace the if/else/endif with just the iOS branch
               import re
               pattern = r'if \(FEX_IOS_HOST_BUILD\)\s+target_link_options\(arm64ecfex PRIVATE -static\)\s+else\(\)\s+target_link_options\(arm64ecfex PRIVATE -static -nostdlib[^)]+\)\s+target_link_libraries\(arm64ecfex PRIVATE \$\{LIBGCC_PATH\}\)\s+endif\(\)'
-              replacement = 'target_link_options(arm64ecfex PRIVATE -static)'
+              replacement = 'target_link_options(arm64ecfex PRIVATE -static)\ntarget_link_libraries(arm64ecfex PRIVATE c++ c++abi unwind)'
               s2 = re.sub(pattern, replacement, s)
               if s2 != s:
                   open(p, 'w').write(s2)
