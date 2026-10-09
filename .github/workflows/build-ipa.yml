@@ -15,7 +15,7 @@
 #   Madeira IPA        ad-hoc signed, for sideloaders to re-sign
 #
 # Every step follows docs/BUILDING.md and the scripts under build/.
-name: Build IPA (latest upstream)
+name: Build IPA (latest upstream)Build FEX ARM64EC guest translator
 
 on:
   workflow_dispatch:
@@ -253,6 +253,9 @@ jobs:
         run: bash build/fex-ios/build.sh
       - name: Build FEX ARM64EC guest translator
         run: bash build/fex-arm64ec/build.sh
+        env:
+          VERBOSE: 1
+        
       - name: Pack runtime-fex
         run: |
           set -euo pipefail
