@@ -253,11 +253,6 @@ jobs:
         run: bash build/fex-ios/build.sh
       - name: Build FEX ARM64EC guest translator
         run: bash build/fex-arm64ec/build.sh
-        env:
-          VERBOSE: 1
-      - name: Dump FEX linkLibs.rsp (diagnostic)
-        if: always()
-        run: cat FEX/build-arm64ec/Source/Windows/ARM64EC/CMakeFiles/arm64ecfex.dir/linkLibs.rsp
       - name: Pack runtime-fex
         run: |
           set -euo pipefail
