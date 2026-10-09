@@ -255,8 +255,10 @@ jobs:
         run: bash build/fex-arm64ec/build.sh
         env:
           VERBOSE: 1
-        
-      - name: Pack runtime-fex
+           - name: Dump FEX linkLibs.rsp (diagnostic)
+                   if: always()
+                           run: cat FEX/build-arm64ec/Source/Windows/ARM64EC/CMakeFiles/arm64ecfex.dir/linkLibs.rsp
+                                - name: Pack runtime-fex
         run: |
           set -euo pipefail
           test -s FEX/build-ios/include/FEXCore/Config/ConfigValues.inl
