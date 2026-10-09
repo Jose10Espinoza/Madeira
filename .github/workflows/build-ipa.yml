@@ -15,7 +15,7 @@
 #   Madeira IPA        ad-hoc signed, for sideloaders to re-sign
 #
 # Every step follows docs/BUILDING.md and the scripts under build/.
-name: Build IPA (latest upstream)Build FEX ARM64EC guest translator
+name: Build IPA (latest upstream)
 
 on:
   workflow_dispatch:
