@@ -1,0 +1,34 @@
+diff --git a/dlls/ntdll/resource.c b/dlls/ntdll/resource.c
+index 46ded65..ba836ab 100644
+--- a/dlls/ntdll/resource.c
++++ b/dlls/ntdll/resource.c
+@@ -281,8 +281,18 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrFindResourceDirectory_U( HMODULE hmod, cons
+ /**********************************************************************
+  *	LdrFindResource_U  (NTDLL.@)
+  */
+-NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrFindResource_U( HMODULE hmod, const LDR_RESOURCE_INFO *info,
+-                                   ULONG level, const IMAGE_RESOURCE_DATA_ENTRY **entry )
++#ifdef __i386__
++#define HOTPATCH_STUB(name) \
++    __ASM_GLOBAL_FUNC(name, \
++                      ".byte 0x8b,0xff,0x55,0x8b,0xec\n\t" \
++                      "popl %ebp\n\t" \
++                      "jmp " #name "_impl")
++
++HOTPATCH_STUB(LdrFindResource_U)
++#endif
++
++NTSTATUS WINAPI LdrFindResource_U_impl( HMODULE hmod, const LDR_RESOURCE_INFO *info,
++                                        ULONG level, const IMAGE_RESOURCE_DATA_ENTRY **entry )
+ {
+     const void *res;
+     NTSTATUS status;
+@@ -393,7 +403,7 @@ NTSTATUS WINAPI RtlFindMessage( HMODULE hmod, ULONG type, ULONG lang,
+     info.Name     = 1;
+     info.Language = lang;
+ 
+-    if ((status = LdrFindResource_U( hmod, &info, 3, &rsrc )) != STATUS_SUCCESS)
++    if ((status = LdrFindResource_U_impl( hmod, &info, 3, &rsrc )) != STATUS_SUCCESS)
+         return status;
+     if ((status = LdrAccessResource( hmod, rsrc, &ptr, NULL )) != STATUS_SUCCESS)
+         return status;
