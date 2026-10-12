@@ -1,0 +1,41 @@
+diff --git a/dlls/ntdll/resource.c b/dlls/ntdll/resource.c
+index 46ded65..b356924 100644
+--- a/dlls/ntdll/resource.c
++++ b/dlls/ntdll/resource.c
+@@ -281,8 +281,16 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrFindResourceDirectory_U( HMODULE hmod, cons
+ /**********************************************************************
+  *	LdrFindResource_U  (NTDLL.@)
+  */
+-NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrFindResource_U( HMODULE hmod, const LDR_RESOURCE_INFO *info,
+-                                   ULONG level, const IMAGE_RESOURCE_DATA_ENTRY **entry )
++#ifdef __i386__
++#pragma message("LdrFindResource_U stub: i386 branch taken")
++# define LDR_FIND_RESOURCE_U_NAME LdrFindResource_U_impl
++__attribute__((used)) static
++#else
++#pragma message("LdrFindResource_U stub: non-i386 branch taken")
++# define LDR_FIND_RESOURCE_U_NAME LdrFindResource_U
++#endif
++NTSTATUS WINAPI DECLSPEC_HOTPATCH LDR_FIND_RESOURCE_U_NAME( HMODULE hmod, const LDR_RESOURCE_INFO *info,
++                                                            ULONG level, const IMAGE_RESOURCE_DATA_ENTRY **entry )
+ {
+     const void *res;
+     NTSTATUS status;
+@@ -346,6 +354,17 @@ static inline NTSTATUS access_resource( HMODULE hmod, const IMAGE_RESOURCE_DATA_
+     return status;
+ }
+ 
++#ifdef __i386__
++__attribute__((naked))
++NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrFindResource_U( HMODULE hmod, const LDR_RESOURCE_INFO *info,
++                                                     ULONG level, const IMAGE_RESOURCE_DATA_ENTRY **entry )
++{
++    __asm__( ".byte 0x8b,0xff,0x55,0x8b,0xec\n\t"
++             "popl %ebp\n\t"
++             "jmp _LdrFindResource_U_impl@16" );
++}
++#endif
++
+ /**********************************************************************
+  *	LdrAccessResource  (NTDLL.@)
+  *
