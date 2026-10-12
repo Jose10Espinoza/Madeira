@@ -1,0 +1,30 @@
+--- a/dlls/ntdll/resource.c
++++ b/dlls/ntdll/resource.c
+@@ -278,7 +278,15 @@ static NTSTATUS get_resource_directory(
+  *	LdrFindResource_U  (NTDLL.@)
+  */
+-NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrFindResource_U( HMODULE hmod, const LDR_RESOURCE_INFO *info,
+-                                   ULONG level, const IMAGE_RESOURCE_DATA_ENTRY **entry )
++#define HOTPATCH_STUB(name) \
++    __ASM_GLOBAL_FUNC(name, \
++                      "movl %edi,%edi\n	" \
++                      "pushl %ebp\n	" \
++                      "movl %esp,%ebp\n	" \
++                      "popl %ebp\n	" \
++                      "jmp " #name "_impl")
++
++HOTPATCH_STUB(LdrFindResource_U)
++
++NTSTATUS WINAPI LdrFindResource_U_impl( HMODULE hmod, const LDR_RESOURCE_INFO *info,
++                                        ULONG level, const IMAGE_RESOURCE_DATA_ENTRY **entry )
+ {
+     const void *res;
+     NTSTATUS status;
+@@ -393,6 +403,6 @@ NTSTATUS WINAPI LdrFindResourceEx_U( HMODULE hmod, const LDR_RESOURCE_INFO *info
+     info.Language = lang;
+ 
+-    if ((status = LdrFindResource_U( hmod, &info, 3, &rsrc )) != STATUS_SUCCESS)
++    if ((status = LdrFindResource_U_impl( hmod, &info, 3, &rsrc )) != STATUS_SUCCESS)
+         return status;
+     if ((status = LdrAccessResource( hmod, rsrc, &ptr, NULL )) != STATUS_SUCCESS)
+         return status;
