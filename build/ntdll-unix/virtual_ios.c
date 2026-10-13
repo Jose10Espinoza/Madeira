@@ -14555,6 +14555,9 @@ static void *map_reserved_area_inner( void *limit_low, void *limit_high, size_t 
 /***********************************************************************
  *           map_fixed_area
  *
+ * Map a memory area at a fixed address.
+ * virtual_mutex must be held by caller.
+ */
 #ifdef MADEIRA_VM_DEBUG
 static void ios_dbg_conflict( void *base, size_t size, struct file_view *v )
 {
@@ -14576,10 +14579,6 @@ static void ios_dbg_conflict( void *base, size_t size, struct file_view *v )
     }
 }
 #endif
-
-/* Map a memory area at a fixed address.
- * virtual_mutex must be held by caller.
- */
 static NTSTATUS map_fixed_area( void *base, size_t size, int unix_prot )
 {
     struct reserved_area *area;
