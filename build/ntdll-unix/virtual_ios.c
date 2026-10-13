@@ -5265,6 +5265,10 @@ struct reserved_area
 
 static struct list reserved_areas = LIST_INIT(reserved_areas);
 
+/* DIAGNOSTIC: MADEIRA_VM_DEBUG enabled for hook-engine alloc investigation.
+ * Remove this define (and the #ifdef blocks) once the cause is found. */
+#define MADEIRA_VM_DEBUG 1
+
 /* ml814: per-request allocation-failure attribution.
  *
  * ml813 used a SHARED GLOBAL for this and it lied immediately: three different
@@ -14551,7 +14555,29 @@ static void *map_reserved_area_inner( void *limit_low, void *limit_high, size_t 
 /***********************************************************************
  *           map_fixed_area
  *
- * Map a memory area at a fixed address.
+#ifdef MADEIRA_VM_DEBUG
+static void ios_dbg_conflict( void *base, size_t size, struct file_view *v )
+{
+    static struct file_view *last;
+    static BOOL dumped;
+    struct reserved_area *a;
+
+    if (v != last)
+    {
+        last = v;
+        ERR( "IOSDBG conflict: req %p+%#zx hits view %p+%#zx prot=%#x\n",
+             base, size, v->base, (size_t)v->size, (unsigned)v->protect );
+    }
+    if (!dumped)
+    {
+        dumped = TRUE;
+        LIST_FOR_EACH_ENTRY( a, &reserved_areas, struct reserved_area, entry )
+            ERR( "IOSDBG reserved area %p-%p\n", a->base, (char *)a->base + a->size );
+    }
+}
+#endif
+
+/* Map a memory area at a fixed address.
  * virtual_mutex must be held by caller.
  */
 static NTSTATUS map_fixed_area( void *base, size_t size, int unix_prot )
@@ -14559,9 +14585,29 @@ static NTSTATUS map_fixed_area( void *base, size_t size, int unix_prot )
     struct reserved_area *area;
     NTSTATUS status;
     char *start = base, *end = (char *)base + ROUND_SIZE( 0, size, host_page_mask );
+#ifdef MADEIRA_VM_DEBUG
+    struct file_view *dbg_v;
+    { static unsigned calls;
+      if (!(calls++ & 0x3ff)) ERR( "IOSDBG map_fixed_area #%u base=%p size=%#zx\n", calls, base, size ); }
+#endif
 
-    if ((UINT_PTR)base & host_page_mask) return STATUS_CONFLICTING_ADDRESSES;
+    if ((UINT_PTR)base & host_page_mask)
+    {
+#ifdef MADEIRA_VM_DEBUG
+        { static unsigned n;
+          if (!(n++ & 0xfff)) ERR( "IOSDBG misaligned base=%p mask=%#lx\n", base, (unsigned long)host_page_mask ); }
+#endif
+        return STATUS_CONFLICTING_ADDRESSES;
+    }
+#ifdef MADEIRA_VM_DEBUG
+    if ((dbg_v = find_view_range( base, size )))
+    {
+        ios_dbg_conflict( base, size, dbg_v );
+        return STATUS_CONFLICTING_ADDRESSES;
+    }
+#else
     if (find_view_range( base, size )) return STATUS_CONFLICTING_ADDRESSES;
+#endif
 
     LIST_FOR_EACH_ENTRY( area, &reserved_areas, struct reserved_area, entry )
     {
@@ -14588,6 +14634,13 @@ static NTSTATUS map_fixed_area( void *base, size_t size, int unix_prot )
     return STATUS_SUCCESS;
 
 failed:
+#ifdef MADEIRA_VM_DEBUG
+    { int e = errno; static int last_e; static unsigned n;
+      if (e != last_e || !(n++ & 0xfff))
+          ERR( "IOSDBG tryfixed failed: errno=%d req %p+%#zx start=%p af_stage=%d af_err=%d af_addr=%llx\n",
+               e, base, size, start, ios_af.stage, ios_af.err, ios_af.addr );
+      last_e = e; errno = e; }
+#endif
     if (errno == ENOMEM)
     {
         ERR( "out of memory for %p-%p\n", base, (char *)base + size );
